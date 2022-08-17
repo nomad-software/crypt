@@ -247,6 +247,9 @@ func TestASN1ObjectIdentifier(t *testing.T) {
 		{[]byte{6, 4, 85, 0x02, 0xc0, 0x00}, true, []int{2, 5, 2, 0x2000}},
 		{[]byte{6, 3, 0x81, 0x34, 0x03}, true, []int{2, 100, 3}},
 		{[]byte{6, 7, 85, 0x02, 0xc0, 0x80, 0x80, 0x80, 0x80}, false, []int{}},
+		{[]byte{6, 7, 85, 0x02, 0x85, 0xc7, 0xcc, 0xfb, 0x01}, true, []int{2, 5, 2, 1492336001}},
+		{[]byte{6, 7, 0x55, 0x02, 0x87, 0xff, 0xff, 0xff, 0x7f}, true, []int{2, 5, 2, 2147483647}}, // 2**31-1
+		{[]byte{6, 7, 0x55, 0x02, 0x88, 0x80, 0x80, 0x80, 0x00}, false, []int{}},                   // 2**31
 	}
 
 	for i, test := range testData {
@@ -307,6 +310,37 @@ func TestReadASN1GeneralizedTime(t *testing.T) {
 		ok := in.ReadASN1GeneralizedTime(&out)
 		if ok != test.ok || ok && !reflect.DeepEqual(out, test.out) {
 			t.Errorf("#%d: in.ReadASN1GeneralizedTime() = %v, want %v; out = %q, want %q", i, ok, test.ok, out, test.out)
+		}
+	}
+}
+
+func TestReadASN1UTCTime(t *testing.T) {
+	testData := []struct {
+		in  string
+		ok  bool
+		out time.Time
+	}{
+		{"000102030405Z", true, time.Date(2000, 01, 02, 03, 04, 05, 0, time.UTC)},
+		{"500102030405Z", true, time.Date(1950, 01, 02, 03, 04, 05, 0, time.UTC)},
+		{"490102030405Z", true, time.Date(2049, 01, 02, 03, 04, 05, 0, time.UTC)},
+		{"990102030405Z", true, time.Date(1999, 01, 02, 03, 04, 05, 0, time.UTC)},
+		{"250102030405Z", true, time.Date(2025, 01, 02, 03, 04, 05, 0, time.UTC)},
+		{"750102030405Z", true, time.Date(1975, 01, 02, 03, 04, 05, 0, time.UTC)},
+		{"000102030405+0905", true, time.Date(2000, 01, 02, 03, 04, 05, 0, time.FixedZone("", 9*60*60+5*60))},
+		{"000102030405-0905", true, time.Date(2000, 01, 02, 03, 04, 05, 0, time.FixedZone("", -9*60*60-5*60))},
+		{"0001020304Z", true, time.Date(2000, 01, 02, 03, 04, 0, 0, time.UTC)},
+		{"5001020304Z", true, time.Date(1950, 01, 02, 03, 04, 00, 0, time.UTC)},
+		{"0001020304+0905", true, time.Date(2000, 01, 02, 03, 04, 0, 0, time.FixedZone("", 9*60*60+5*60))},
+		{"0001020304-0905", true, time.Date(2000, 01, 02, 03, 04, 0, 0, time.FixedZone("", -9*60*60-5*60))},
+		{"000102030405Z0700", false, time.Time{}},
+		{"000102030405", false, time.Time{}},
+	}
+	for i, test := range testData {
+		in := String(append([]byte{byte(asn1.UTCTime), byte(len(test.in))}, test.in...))
+		var out time.Time
+		ok := in.ReadASN1UTCTime(&out)
+		if ok != test.ok || ok && !reflect.DeepEqual(out, test.out) {
+			t.Errorf("#%d: in.ReadASN1UTCTime() = %v, want %v; out = %q, want %q", i, ok, test.ok, out, test.out)
 		}
 	}
 }

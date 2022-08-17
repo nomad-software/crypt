@@ -6,6 +6,8 @@ package http2
 
 import (
 	"bytes"
+	"compress/gzip"
+	"compress/zlib"
 	"context"
 	"crypto/tls"
 	"errors"
@@ -41,14 +43,37 @@ func stderrv() io.Writer {
 	return ioutil.Discard
 }
 
+type safeBuffer struct {
+	b bytes.Buffer
+	m sync.Mutex
+}
+
+func (sb *safeBuffer) Write(d []byte) (int, error) {
+	sb.m.Lock()
+	defer sb.m.Unlock()
+	return sb.b.Write(d)
+}
+
+func (sb *safeBuffer) Bytes() []byte {
+	sb.m.Lock()
+	defer sb.m.Unlock()
+	return sb.b.Bytes()
+}
+
+func (sb *safeBuffer) Len() int {
+	sb.m.Lock()
+	defer sb.m.Unlock()
+	return sb.b.Len()
+}
+
 type serverTester struct {
 	cc             net.Conn // client conn
 	t              testing.TB
 	ts             *httptest.Server
 	fr             *Framer
-	serverLogBuf   bytes.Buffer // logger for httptest.Server
-	logFilter      []string     // substrings to filter out
-	scMu           sync.Mutex   // guards sc
+	serverLogBuf   safeBuffer // logger for httptest.Server
+	logFilter      []string   // substrings to filter out
+	scMu           sync.Mutex // guards sc
 	sc             *serverConn
 	hpackDec       *hpack.Decoder
 	decodedHeaders [][2]string
@@ -1160,11 +1185,58 @@ func TestServer_Ping(t *testing.T) {
 	}
 }
 
-func TestServer_RejectsLargeFrames(t *testing.T) {
-	if runtime.GOOS == "windows" {
-		t.Skip("see golang.org/issue/13434")
+type filterListener struct {
+	net.Listener
+	accept func(conn net.Conn) (net.Conn, error)
+}
+
+func (l *filterListener) Accept() (net.Conn, error) {
+	c, err := l.Listener.Accept()
+	if err != nil {
+		return nil, err
+	}
+	return l.accept(c)
+}
+
+func TestServer_MaxQueuedControlFrames(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping in short mode")
 	}
 
+	st := newServerTester(t, nil, func(ts *httptest.Server) {
+		// TCP buffer sizes on test systems aren't under our control and can be large.
+		// Create a conn that blocks after 10000 bytes written.
+		ts.Listener = &filterListener{
+			Listener: ts.Listener,
+			accept: func(conn net.Conn) (net.Conn, error) {
+				return newBlockingWriteConn(conn, 10000), nil
+			},
+		}
+	})
+	defer st.Close()
+	st.greet()
+
+	const extraPings = 500000 // enough to fill the TCP buffers
+
+	for i := 0; i < maxQueuedControlFrames+extraPings; i++ {
+		pingData := [8]byte{1, 2, 3, 4, 5, 6, 7, 8}
+		if err := st.fr.WritePing(false, pingData); err != nil {
+			if i == 0 {
+				t.Fatal(err)
+			}
+			// We expect the connection to get closed by the server when the TCP
+			// buffer fills up and the write queue reaches MaxQueuedControlFrames.
+			t.Logf("sent %d PING frames", i)
+			return
+		}
+	}
+	t.Errorf("unexpected success sending all PING frames")
+}
+
+func TestServer_RejectsLargeFrames(t *testing.T) {
+	if runtime.GOOS == "windows" || runtime.GOOS == "plan9" || runtime.GOOS == "zos" {
+		t.Skip("see golang.org/issue/13434, golang.org/issue/37321")
+	}
 	st := newServerTester(t, nil)
 	defer st.Close()
 	st.greet()
@@ -1725,6 +1797,117 @@ func TestServer_Response_NoData_Header_FooBar(t *testing.T) {
 			t.Errorf("Got headers %v; want %v", goth, wanth)
 		}
 	})
+}
+
+// Reject content-length headers containing a sign.
+// See https://golang.org/issue/39017
+func TestServerIgnoresContentLengthSignWhenWritingChunks(t *testing.T) {
+	tests := []struct {
+		name   string
+		cl     string
+		wantCL string
+	}{
+		{
+			name:   "proper content-length",
+			cl:     "3",
+			wantCL: "3",
+		},
+		{
+			name:   "ignore cl with plus sign",
+			cl:     "+3",
+			wantCL: "0",
+		},
+		{
+			name:   "ignore cl with minus sign",
+			cl:     "-3",
+			wantCL: "0",
+		},
+		{
+			name:   "max int64, for safe uint64->int64 conversion",
+			cl:     "9223372036854775807",
+			wantCL: "9223372036854775807",
+		},
+		{
+			name:   "overflows int64, so ignored",
+			cl:     "9223372036854775808",
+			wantCL: "0",
+		},
+	}
+
+	for _, tt := range tests {
+		testServerResponse(t, func(w http.ResponseWriter, r *http.Request) error {
+			w.Header().Set("content-length", tt.cl)
+			return nil
+		}, func(st *serverTester) {
+			getSlash(st)
+			hf := st.wantHeaders()
+			goth := st.decodeHeader(hf.HeaderBlockFragment())
+			wanth := [][2]string{
+				{":status", "200"},
+				{"content-length", tt.wantCL},
+			}
+			if !reflect.DeepEqual(goth, wanth) {
+				t.Errorf("For case %q, value %q, got = %q; want %q", tt.name, tt.cl, goth, wanth)
+			}
+		})
+	}
+}
+
+// Reject content-length headers containing a sign.
+// See https://golang.org/issue/39017
+func TestServerRejectsContentLengthWithSignNewRequests(t *testing.T) {
+	tests := []struct {
+		name   string
+		cl     string
+		wantCL int64
+	}{
+		{
+			name:   "proper content-length",
+			cl:     "3",
+			wantCL: 3,
+		},
+		{
+			name:   "ignore cl with plus sign",
+			cl:     "+3",
+			wantCL: 0,
+		},
+		{
+			name:   "ignore cl with minus sign",
+			cl:     "-3",
+			wantCL: 0,
+		},
+		{
+			name:   "max int64, for safe uint64->int64 conversion",
+			cl:     "9223372036854775807",
+			wantCL: 9223372036854775807,
+		},
+		{
+			name:   "overflows int64, so ignored",
+			cl:     "9223372036854775808",
+			wantCL: 0,
+		},
+	}
+
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			writeReq := func(st *serverTester) {
+				st.writeHeaders(HeadersFrameParam{
+					StreamID:      1, // clients send odd numbers
+					BlockFragment: st.encodeHeader("content-length", tt.cl),
+					EndStream:     false,
+					EndHeaders:    true,
+				})
+				st.writeData(1, false, []byte(""))
+			}
+			checkReq := func(r *http.Request) {
+				if r.ContentLength != tt.wantCL {
+					t.Fatalf("Got: %q\nWant: %q", r.ContentLength, tt.wantCL)
+				}
+			}
+			testServerRequest(t, writeReq, checkReq)
+		})
+	}
 }
 
 func TestServer_Response_Data_Sniff_DoesntOverride(t *testing.T) {
@@ -2408,6 +2591,10 @@ func TestServer_Rejects_TLS11(t *testing.T) { testRejectTLS(t, tls.VersionTLS11)
 
 func testRejectTLS(t *testing.T, max uint16) {
 	st := newServerTester(t, nil, func(c *tls.Config) {
+		// As of 1.18 the default minimum Go TLS version is
+		// 1.2. In order to test rejection of lower versions,
+		// manually set the minimum version to 1.0
+		c.MinVersion = tls.VersionTLS10
 		c.MaxVersion = max
 	})
 	defer st.Close()
@@ -2706,6 +2893,26 @@ func TestServerDoS_MaxHeaderListSize(t *testing.T) {
 	if !reflect.DeepEqual(headers, want) {
 		t.Errorf("Headers mismatch.\n got: %q\nwant: %q\n", headers, want)
 	}
+}
+
+func TestServer_Response_Stream_With_Missing_Trailer(t *testing.T) {
+	testServerResponse(t, func(w http.ResponseWriter, r *http.Request) error {
+		w.Header().Set("Trailer", "test-trailer")
+		return nil
+	}, func(st *serverTester) {
+		getSlash(st)
+		hf := st.wantHeaders()
+		if !hf.HeadersEnded() {
+			t.Fatal("want END_HEADERS flag")
+		}
+		df := st.wantData()
+		if len(df.data) != 0 {
+			t.Fatal("did not want data")
+		}
+		if !df.StreamEnded() {
+			t.Fatal("want END_STREAM flag")
+		}
+	})
 }
 
 func TestCompressionErrorOnWrite(t *testing.T) {
@@ -3174,6 +3381,26 @@ func (c *issue53Conn) SetDeadline(t time.Time) error      { return nil }
 func (c *issue53Conn) SetReadDeadline(t time.Time) error  { return nil }
 func (c *issue53Conn) SetWriteDeadline(t time.Time) error { return nil }
 
+// golang.org/issue/33839
+func TestServeConnOptsNilReceiverBehavior(t *testing.T) {
+	defer func() {
+		if r := recover(); r != nil {
+			t.Errorf("got a panic that should not happen: %v", r)
+		}
+	}()
+
+	var o *ServeConnOpts
+	if o.context() == nil {
+		t.Error("o.context should not return nil")
+	}
+	if o.baseConfig() == nil {
+		t.Error("o.baseConfig should not return nil")
+	}
+	if o.handler() == nil {
+		t.Error("o.handler should not return nil")
+	}
+}
+
 // golang.org/issue/12895
 func TestConfigureServer(t *testing.T) {
 	tests := []struct {
@@ -3183,6 +3410,17 @@ func TestConfigureServer(t *testing.T) {
 	}{
 		{
 			name: "empty server",
+		},
+		{
+			name:      "empty CipherSuites",
+			tlsConfig: &tls.Config{},
+		},
+		{
+			name: "bad CipherSuites but MinVersion TLS 1.3",
+			tlsConfig: &tls.Config{
+				MinVersion:   tls.VersionTLS13,
+				CipherSuites: []uint16{tls.TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384},
+			},
 		},
 		{
 			name: "just the required cipher suite",
@@ -3201,14 +3439,13 @@ func TestConfigureServer(t *testing.T) {
 			tlsConfig: &tls.Config{
 				CipherSuites: []uint16{tls.TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384},
 			},
-			wantErr: "is missing an HTTP/2-required AES_128_GCM_SHA256 cipher.",
+			wantErr: "is missing an HTTP/2-required",
 		},
 		{
 			name: "required after bad",
 			tlsConfig: &tls.Config{
 				CipherSuites: []uint16{tls.TLS_RSA_WITH_RC4_128_SHA, tls.TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256},
 			},
-			wantErr: "contains an HTTP/2-approved cipher suite (0xc02f), but it comes after",
 		},
 		{
 			name: "bad after required",
@@ -3590,37 +3827,73 @@ func (f funcReader) Read(p []byte) (n int, err error) { return f(p) }
 // golang.org/issue/16481 -- return flow control when streams close with unread data.
 // (The Server version of the bug. See also TestUnreadFlowControlReturned_Transport)
 func TestUnreadFlowControlReturned_Server(t *testing.T) {
-	unblock := make(chan bool, 1)
-	defer close(unblock)
+	for _, tt := range []struct {
+		name  string
+		reqFn func(r *http.Request)
+	}{
+		{
+			"body-open",
+			func(r *http.Request) {},
+		},
+		{
+			"body-closed",
+			func(r *http.Request) {
+				r.Body.Close()
+			},
+		},
+		{
+			"read-1-byte-and-close",
+			func(r *http.Request) {
+				b := make([]byte, 1)
+				r.Body.Read(b)
+				r.Body.Close()
+			},
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			unblock := make(chan bool, 1)
+			defer close(unblock)
 
-	st := newServerTester(t, func(w http.ResponseWriter, r *http.Request) {
-		// Don't read the 16KB request body. Wait until the client's
-		// done sending it and then return. This should cause the Server
-		// to then return those 16KB of flow control to the client.
-		<-unblock
-	}, optOnlyServer)
-	defer st.Close()
+			timeOut := time.NewTimer(5 * time.Second)
+			defer timeOut.Stop()
+			st := newServerTester(t, func(w http.ResponseWriter, r *http.Request) {
+				// Don't read the 16KB request body. Wait until the client's
+				// done sending it and then return. This should cause the Server
+				// to then return those 16KB of flow control to the client.
+				tt.reqFn(r)
+				select {
+				case <-unblock:
+				case <-timeOut.C:
+					t.Fatal(tt.name, "timedout")
+				}
+			}, optOnlyServer)
+			defer st.Close()
 
-	tr := &Transport{TLSClientConfig: tlsConfigInsecure}
-	defer tr.CloseIdleConnections()
+			tr := &Transport{TLSClientConfig: tlsConfigInsecure}
+			defer tr.CloseIdleConnections()
 
-	// This previously hung on the 4th iteration.
-	for i := 0; i < 6; i++ {
-		body := io.MultiReader(
-			io.LimitReader(neverEnding('A'), 16<<10),
-			funcReader(func([]byte) (n int, err error) {
-				unblock <- true
-				return 0, io.EOF
-			}),
-		)
-		req, _ := http.NewRequest("POST", st.ts.URL, body)
-		res, err := tr.RoundTrip(req)
-		if err != nil {
-			t.Fatal(err)
-		}
-		res.Body.Close()
+			// This previously hung on the 4th iteration.
+			iters := 100
+			if testing.Short() {
+				iters = 20
+			}
+			for i := 0; i < iters; i++ {
+				body := io.MultiReader(
+					io.LimitReader(neverEnding('A'), 16<<10),
+					funcReader(func([]byte) (n int, err error) {
+						unblock <- true
+						return 0, io.EOF
+					}),
+				)
+				req, _ := http.NewRequest("POST", st.ts.URL, body)
+				res, err := tr.RoundTrip(req)
+				if err != nil {
+					t.Fatal(tt.name, err)
+				}
+				res.Body.Close()
+			}
+		})
 	}
-
 }
 
 func TestServerIdleTimeout(t *testing.T) {
@@ -3898,5 +4171,199 @@ func TestServerGracefulShutdown(t *testing.T) {
 	n, err := st.cc.Read([]byte{0})
 	if n != 0 || err == nil {
 		t.Errorf("Read = %v, %v; want 0, non-nil", n, err)
+	}
+}
+
+// Issue 31753: don't sniff when Content-Encoding is set
+func TestContentEncodingNoSniffing(t *testing.T) {
+	type resp struct {
+		name string
+		body []byte
+		// setting Content-Encoding as an interface instead of a string
+		// directly, so as to differentiate between 3 states:
+		//    unset, empty string "" and set string "foo/bar".
+		contentEncoding interface{}
+		wantContentType string
+	}
+
+	resps := []*resp{
+		{
+			name:            "gzip content-encoding, gzipped", // don't sniff.
+			contentEncoding: "application/gzip",
+			wantContentType: "",
+			body: func() []byte {
+				buf := new(bytes.Buffer)
+				gzw := gzip.NewWriter(buf)
+				gzw.Write([]byte("doctype html><p>Hello</p>"))
+				gzw.Close()
+				return buf.Bytes()
+			}(),
+		},
+		{
+			name:            "zlib content-encoding, zlibbed", // don't sniff.
+			contentEncoding: "application/zlib",
+			wantContentType: "",
+			body: func() []byte {
+				buf := new(bytes.Buffer)
+				zw := zlib.NewWriter(buf)
+				zw.Write([]byte("doctype html><p>Hello</p>"))
+				zw.Close()
+				return buf.Bytes()
+			}(),
+		},
+		{
+			name:            "no content-encoding", // must sniff.
+			wantContentType: "application/x-gzip",
+			body: func() []byte {
+				buf := new(bytes.Buffer)
+				gzw := gzip.NewWriter(buf)
+				gzw.Write([]byte("doctype html><p>Hello</p>"))
+				gzw.Close()
+				return buf.Bytes()
+			}(),
+		},
+		{
+			name:            "phony content-encoding", // don't sniff.
+			contentEncoding: "foo/bar",
+			body:            []byte("doctype html><p>Hello</p>"),
+		},
+		{
+			name:            "empty but set content-encoding",
+			contentEncoding: "",
+			wantContentType: "audio/mpeg",
+			body:            []byte("ID3"),
+		},
+	}
+
+	tr := &Transport{TLSClientConfig: tlsConfigInsecure}
+	defer tr.CloseIdleConnections()
+
+	for _, tt := range resps {
+		t.Run(tt.name, func(t *testing.T) {
+			st := newServerTester(t, func(w http.ResponseWriter, r *http.Request) {
+				if tt.contentEncoding != nil {
+					w.Header().Set("Content-Encoding", tt.contentEncoding.(string))
+				}
+				w.Write(tt.body)
+			}, optOnlyServer)
+			defer st.Close()
+
+			req, _ := http.NewRequest("GET", st.ts.URL, nil)
+			res, err := tr.RoundTrip(req)
+			if err != nil {
+				t.Fatalf("Failed to fetch URL: %v", err)
+			}
+			defer res.Body.Close()
+			if g, w := res.Header.Get("Content-Encoding"), tt.contentEncoding; g != w {
+				if w != nil { // The case where contentEncoding was set explicitly.
+					t.Errorf("Content-Encoding mismatch\n\tgot:  %q\n\twant: %q", g, w)
+				} else if g != "" { // "" should be the equivalent when the contentEncoding is unset.
+					t.Errorf("Unexpected Content-Encoding %q", g)
+				}
+			}
+			if g, w := res.Header.Get("Content-Type"), tt.wantContentType; g != w {
+				t.Errorf("Content-Type mismatch\n\tgot:  %q\n\twant: %q", g, w)
+			}
+		})
+	}
+}
+
+func TestServerWindowUpdateOnBodyClose(t *testing.T) {
+	const content = "12345678"
+	blockCh := make(chan bool)
+	errc := make(chan error, 1)
+	st := newServerTester(t, func(w http.ResponseWriter, r *http.Request) {
+		buf := make([]byte, 4)
+		n, err := io.ReadFull(r.Body, buf)
+		if err != nil {
+			errc <- err
+			return
+		}
+		if n != len(buf) {
+			errc <- fmt.Errorf("too few bytes read: %d", n)
+			return
+		}
+		blockCh <- true
+		<-blockCh
+		errc <- nil
+	})
+	defer st.Close()
+
+	st.greet()
+	st.writeHeaders(HeadersFrameParam{
+		StreamID: 1, // clients send odd numbers
+		BlockFragment: st.encodeHeader(
+			":method", "POST",
+			"content-length", strconv.Itoa(len(content)),
+		),
+		EndStream:  false, // to say DATA frames are coming
+		EndHeaders: true,
+	})
+	st.writeData(1, false, []byte(content[:5]))
+	<-blockCh
+	st.stream(1).body.CloseWithError(io.EOF)
+	st.writeData(1, false, []byte(content[5:]))
+	blockCh <- true
+
+	increments := len(content)
+	for {
+		f, err := st.readFrame()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		if wu, ok := f.(*WindowUpdateFrame); ok && wu.StreamID == 0 {
+			increments -= int(wu.Increment)
+			if increments == 0 {
+				break
+			}
+		}
+	}
+
+	if err := <-errc; err != nil {
+		t.Error(err)
+	}
+}
+
+func TestNoErrorLoggedOnPostAfterGOAWAY(t *testing.T) {
+	st := newServerTester(t, func(w http.ResponseWriter, r *http.Request) {})
+	defer st.Close()
+
+	st.greet()
+
+	content := "some content"
+	st.writeHeaders(HeadersFrameParam{
+		StreamID: 1,
+		BlockFragment: st.encodeHeader(
+			":method", "POST",
+			"content-length", strconv.Itoa(len(content)),
+		),
+		EndStream:  false,
+		EndHeaders: true,
+	})
+	st.wantHeaders()
+
+	st.sc.startGracefulShutdown()
+	for {
+		f, err := st.readFrame()
+		if err == io.EOF {
+			st.t.Fatal("got a EOF; want *GoAwayFrame")
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		if gf, ok := f.(*GoAwayFrame); ok && gf.StreamID == 0 {
+			break
+		}
+	}
+
+	st.writeData(1, true, []byte(content))
+	time.Sleep(200 * time.Millisecond)
+	st.Close()
+
+	if bytes.Contains(st.serverLogBuf.Bytes(), []byte("PROTOCOL_ERROR")) {
+		t.Error("got protocol error")
 	}
 }

@@ -2,6 +2,7 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
+//go:build aix || darwin || dragonfly || freebsd || linux || netbsd || openbsd || plan9
 // +build aix darwin dragonfly freebsd linux netbsd openbsd plan9
 
 package test
@@ -34,7 +35,7 @@ Banner {{.Dir}}/banner
 HostKey {{.Dir}}/id_rsa
 HostKey {{.Dir}}/id_dsa
 HostKey {{.Dir}}/id_ecdsa
-HostCertificate {{.Dir}}/id_rsa-cert.pub
+HostCertificate {{.Dir}}/id_rsa-sha2-512-cert.pub
 Pidfile {{.Dir}}/sshd.pid
 #UsePrivilegeSeparation no
 KeyRegenerationInterval 3600

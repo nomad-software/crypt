@@ -760,6 +760,12 @@ func TestHostKeyAlgorithms(t *testing.T) {
 	clientConf.HostKeyAlgorithms = []string{KeyAlgoRSA}
 	connect(clientConf, KeyAlgoRSA)
 
+	// Client asks for RSA-SHA2-512 explicitly.
+	clientConf.HostKeyAlgorithms = []string{KeyAlgoRSASHA512}
+	// We get back an "ssh-rsa" key but the verification happened
+	// with an RSA-SHA2-512 signature.
+	connect(clientConf, KeyAlgoRSA)
+
 	c1, c2, err := netPipe()
 	if err != nil {
 		t.Fatalf("netPipe: %v", err)
